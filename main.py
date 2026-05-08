@@ -175,7 +175,7 @@ if fetch_clicked:
 st.divider()
 
 if not st.session_state.ingestion_done:
-    st.info("👆 Click **Fetch & Process News** in the sidebar to get started.")
+    st.info(" Click **Fetch & Process News** in the sidebar to get started.")
 else:
     question = st.text_input(
         "Ask a question about today's finance news:",
