@@ -46,7 +46,7 @@ FINANCE_KEYWORDS = {
     "export", "import", "rupee", "dollar", "crude", "oil", "gold",
     "bank", "finance", "financial", "analyst", "forecast", "growth",
     "recession", "rally", "correction", "bull", "bear", "sector",
-    "acquisition", "merger", "valuation", "startup", "venture", "capital",
+    "acquisition", "merger", "valuation", "startup", "venture", "capital", "election"
 }
 
 # Boilerplate patterns — chunks matching any of these are dropped
@@ -385,8 +385,7 @@ def query(question: str, retriever) -> dict:
 
     # Step 3 — build prompt
     prompt = f"""You are a financial news analyst. Use the context below to answer the question.
-Be concise and factual. Only use information from the provided context.
-
+Be concise and factual.
 Context:
 {context}
 
