@@ -1,0 +1,17 @@
+# Secrets — never commit these
+.env
+.streamlit/secrets.toml
+
+# FAISS index — commit only when pre-building for Streamlit Cloud deploy
+# faiss_store_finsight/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db

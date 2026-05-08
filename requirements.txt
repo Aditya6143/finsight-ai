@@ -1,0 +1,16 @@
+# Core — always required
+streamlit
+feedparser
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+langchain-ollama
+faiss-cpu
+unstructured
+numpy
+python-dotenv
+
+# OpenAI provider
+openai
+langchain-openai
