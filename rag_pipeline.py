@@ -1,5 +1,5 @@
 """
-rag_pipeline.py — RAG Engine for RockyBot / FinSight
+rag_pipeline.py — RAG Engine for FinSight AI
 
 Responsibilities:
 - Load article text from URLs (UnstructuredURLLoader)
@@ -9,6 +9,18 @@ Responsibilities:
 - Persist / load FAISS vectorstore to/from disk (with embed metadata guard)
 - Layer 2: Cosine-equivalent filter using FAISS native L2 scores (no per-chunk re-embedding)
 - Query via manual prompt chain + provider-selectable LLM
+
+Fixes applied:
+  Fix 2 — FINANCE_KEYWORDS expanded to include political / macro-event terms
+           so that election, policy, and government-related chunks are not
+           silently dropped by the Layer 1 filter.
+  Fix 3 — EMBEDDINGS_SIMILARITY_THRESHOLD lowered to 0.35 (L2-converted scale);
+           a guaranteed fallback returns the top-3 FAISS candidates by raw score
+           when all candidates fall below threshold, so the LLM always receives
+           some context rather than an empty list.
+  Fix 4 — query() prompt rewritten to allow the LLM to reason from partial or
+           indirect context and supplement with general financial knowledge when
+           retrieved context is incomplete, clearly signalling when it does so.
 
 No Streamlit — pure pipeline logic, fully testable in isolation.
 """
@@ -31,14 +43,29 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # Configuration — imported from config.py (single source of truth)
 # ---------------------------------------------------------------------------
 
-FAISS_STORE_PATH              = config.FAISS_STORE_PATH
-CHUNK_SIZE                    = config.CHUNK_SIZE
-CHUNK_OVERLAP                 = config.CHUNK_OVERLAP
-MIN_WORD_COUNT                = config.MIN_WORD_COUNT
+FAISS_STORE_PATH               = config.FAISS_STORE_PATH
+CHUNK_SIZE                     = config.CHUNK_SIZE
+CHUNK_OVERLAP                  = config.CHUNK_OVERLAP
+MIN_WORD_COUNT                 = config.MIN_WORD_COUNT
 EMBEDDINGS_SIMILARITY_THRESHOLD = config.EMBEDDINGS_SIMILARITY_THRESHOLD
 
-# Finance domain keywords — at least one must appear in a chunk to pass Layer 1
+# Fix 3: if ALL candidates fall below the threshold, return at least this many
+# by raw FAISS score so the LLM always has something to reason from.
+SIMILARITY_FALLBACK_K = 3
+
+# ---------------------------------------------------------------------------
+# Fix 2 — Expanded keyword set
+#
+# Original set covered pure finance terms only. Added:
+#   - Political / electoral  (election, vote, mandate, party, coalition...)
+#   - Government / regulatory (government, minister, policy, parliament,
+#                              regulatory, reform, tariff, sanction...)
+#   - Macro-economic events  (crisis, sanctions, geopolitical, war,
+#                              supply, commodity, energy...)
+# ---------------------------------------------------------------------------
+
 FINANCE_KEYWORDS = {
+    # Core market terms (original)
     "stock", "share", "market", "equity", "index", "sensex", "nifty",
     "bse", "nse", "rbi", "repo", "rate", "inflation", "gdp", "economy",
     "revenue", "profit", "loss", "earnings", "ipo", "fund", "investment",
@@ -47,9 +74,30 @@ FINANCE_KEYWORDS = {
     "bank", "finance", "financial", "analyst", "forecast", "growth",
     "recession", "rally", "correction", "bull", "bear", "sector",
     "acquisition", "merger", "valuation", "startup", "venture", "capital",
+    # Fix 2: Political & electoral
+    "election", "elections", "electoral", "vote", "votes", "voting",
+    "voter", "voters", "ballot", "poll", "polls", "polling", "mandate",
+    "party", "parties", "coalition", "government", "governor", "minister",
+    "parliament", "legislature", "assembly", "candidate", "campaign",
+    "result", "results", "winner", "victory", "defeat", "majority",
+    "opposition", "incumbent", "ruling", "bjp", "congress", "tmc",
+    "aap", "nda", "upa", "alliance",
+    # Fix 2: Regulatory & policy
+    "policy", "policies", "reform", "reforms", "regulatory", "regulation",
+    "regulations", "sebi", "deregulation", "tariff", "tariffs", "sanction",
+    "sanctions", "stimulus", "subsidy", "subsidies", "privatisation",
+    "divestment", "disinvestment", "taxation", "tax",
+    # Fix 2: Macro-economic events
+    "geopolitical", "geopolitics", "crisis", "war", "conflict", "supply",
+    "demand", "commodity", "commodities", "energy", "power", "infrastructure",
+    "development", "project", "projects", "tender", "contract", "fdi",
+    "foreign", "global", "international", "domestic", "regional", "state",
+    "sentiment", "confidence", "uncertainty", "volatility", "impact",
+    "effect", "affects", "influenced", "driven", "surge", "slump",
+    "pressure", "concerns", "outlook", "guidance",
 }
 
-# Boilerplate patterns — chunks matching any of these are dropped
+# Boilerplate patterns — chunks matching any of these are dropped (unchanged)
 BOILERPLATE_PATTERNS = [
     r"cookie(s)?\s*(policy|consent|banner|notice)",
     r"(accept|agree)\s*(all\s*)?cookies",
@@ -137,7 +185,7 @@ def filter_chunks(chunks: list) -> list:
     Rules applied (a chunk is dropped if ANY rule fails):
       1. Word count >= MIN_WORD_COUNT
       2. Does not match known boilerplate patterns
-      3. Contains at least one finance-domain keyword
+      3. Contains at least one finance/market/political keyword (Fix 2: expanded set)
 
     Args:
         chunks: Raw chunks from split_docs()
@@ -167,7 +215,7 @@ def filter_chunks(chunks: list) -> list:
 
     total_dropped = dropped_short + dropped_boilerplate + dropped_no_keyword
     print(
-        f"[finsight] Layer 1 filter: {len(chunks)} → {len(clean)} chunks "
+        f"[finsight] Layer 1 filter: {len(chunks)} -> {len(clean)} chunks "
         f"(dropped {total_dropped}: {dropped_short} short, "
         f"{dropped_boilerplate} boilerplate, {dropped_no_keyword} off-topic)"
     )
@@ -199,7 +247,7 @@ def _check_metadata(store_path: str) -> str | None:
     """
     meta_file = _metadata_path(store_path)
     if not os.path.exists(meta_file):
-        return None  # old index without metadata — can't verify, skip
+        return None
 
     with open(meta_file) as f:
         meta = json.load(f)
@@ -210,7 +258,7 @@ def _check_metadata(store_path: str) -> str | None:
 
     if saved_provider != config.PROVIDER or saved_model != current_model:
         return (
-            f"⚠️ Index was built with {saved_provider}/{saved_model} but current "
+            f"Index was built with {saved_provider}/{saved_model} but current "
             f"provider is {config.PROVIDER}/{current_model}. "
             f"Answers may be wrong — click 'Fetch & Process News' to rebuild the index."
         )
@@ -271,13 +319,15 @@ def load_vectorstore(store_path: str = FAISS_STORE_PATH) -> tuple[object | None,
 # ---------------------------------------------------------------------------
 # Step 5 — Layer 2: Similarity filter using FAISS native L2 scores
 #
-# Phase 3 cost fix: replaces per-chunk embed_query() calls with FAISS's
-# native similarity_search_with_score(), which returns L2 distances
+# Uses FAISS native similarity_search_with_score() which returns L2 distances
 # computed from vectors already stored in the index — no extra API calls.
 #
-# L2 → similarity conversion: score = 1 / (1 + l2_distance)
-# This maps [0, ∞) to (0, 1] and preserves ordering.
-# The same EMBEDDINGS_SIMILARITY_THRESHOLD is applied to this score.
+# L2 -> similarity conversion: score = 1 / (1 + l2_distance)
+# This maps [0, inf) to (0, 1] and preserves ordering.
+#
+# Fix 3: EMBEDDINGS_SIMILARITY_THRESHOLD lowered in config.py; guaranteed
+# fallback returns top-SIMILARITY_FALLBACK_K chunks when all candidates are
+# below threshold so the LLM is never given an empty context.
 # ---------------------------------------------------------------------------
 
 class SimilarityFilterRetriever:
@@ -285,13 +335,22 @@ class SimilarityFilterRetriever:
     Layer 2 — Query-time retriever that drops chunks below a cosine-equivalent
     similarity threshold. Uses FAISS native L2 scores — no per-chunk re-embedding.
 
-    Drop-in replacement for the broken ContextualCompressionRetriever.
+    Fix 3: guaranteed fallback — if every candidate falls below the threshold,
+    the top SIMILARITY_FALLBACK_K chunks by raw FAISS score are returned so the
+    LLM always receives some context.
     """
 
-    def __init__(self, vectorstore, threshold: float, top_k: int = 10):
+    def __init__(
+        self,
+        vectorstore,
+        threshold: float,
+        top_k: int = 10,
+        fallback_k: int = SIMILARITY_FALLBACK_K,
+    ):
         self.vectorstore = vectorstore
         self.threshold = threshold
         self.top_k = top_k
+        self.fallback_k = fallback_k
 
     def get_relevant_documents(self, query: str) -> list[Document]:
         # Retrieve top_k candidates with L2 distances from FAISS
@@ -299,17 +358,27 @@ class SimilarityFilterRetriever:
             query, k=self.top_k
         )
 
-        # Convert L2 distance → similarity score and apply threshold
+        # Convert L2 distance -> similarity score and apply threshold
         kept = []
         for doc, l2_distance in candidates_with_scores:
             score = 1.0 / (1.0 + float(l2_distance))
             if score >= self.threshold:
                 kept.append(doc)
 
-        print(
-            f"[finsight] Layer 2: {len(candidates_with_scores)} candidates → "
-            f"{len(kept)} kept (threshold={self.threshold})"
-        )
+        # Fix 3: guaranteed fallback — never return empty-handed
+        if not kept and candidates_with_scores:
+            kept = [doc for doc, _ in candidates_with_scores[: self.fallback_k]]
+            print(
+                f"[finsight] Layer 2: all {len(candidates_with_scores)} candidates below "
+                f"threshold {self.threshold}. Falling back to top-{self.fallback_k} "
+                f"by FAISS score."
+            )
+        else:
+            print(
+                f"[finsight] Layer 2: {len(candidates_with_scores)} candidates -> "
+                f"{len(kept)} kept (threshold={self.threshold})"
+            )
+
         return kept
 
     # LangChain chain compatibility
@@ -332,10 +401,12 @@ def get_retriever(vectorstore) -> SimilarityFilterRetriever:
     retriever = SimilarityFilterRetriever(
         vectorstore=vectorstore,
         threshold=EMBEDDINGS_SIMILARITY_THRESHOLD,
+        fallback_k=SIMILARITY_FALLBACK_K,
     )
     print(
         f"[finsight] Layer 2: SimilarityFilterRetriever active "
-        f"(threshold={EMBEDDINGS_SIMILARITY_THRESHOLD}, L2-based scoring)"
+        f"(threshold={EMBEDDINGS_SIMILARITY_THRESHOLD}, L2-based scoring, "
+        f"fallback_k={SIMILARITY_FALLBACK_K})"
     )
     return retriever
 
@@ -348,11 +419,10 @@ def query(question: str, retriever) -> dict:
     """
     Run a question through the RAG chain and return the answer with sources.
 
-    Manual chain (RetrievalQAWithSourcesChain removed in langchain v1.x):
-      1. Retrieve relevant chunks via SimilarityFilterRetriever
-      2. Build a prompt with context + source URLs
-      3. Call provider LLM via llm_provider.get_llm()
-      4. Return answer + sources
+    Fix 4: Prompt rewritten to allow the LLM to reason from partial or indirect
+    context and supplement with general financial knowledge when retrieved context
+    is incomplete, while clearly labelling which parts come from fetched articles
+    versus general knowledge.
 
     Args:
         question:  User's natural language question
@@ -363,12 +433,15 @@ def query(question: str, retriever) -> dict:
           "answer"  — LLM-generated answer string
           "sources" — newline-separated source URLs (may be empty string)
     """
-    # Step 1 — retrieve relevant chunks
+    # Step 1 — retrieve relevant chunks (Fix 3 guarantees at least fallback_k docs)
     docs = retriever.get_relevant_documents(question)
 
     if not docs:
         return {
-            "answer": "I couldn't find relevant information to answer your question.",
+            "answer": (
+                "No articles have been indexed yet. Please fetch and process "
+                "news from the sidebar before asking questions."
+            ),
             "sources": "",
         }
 
@@ -383,18 +456,27 @@ def query(question: str, retriever) -> dict:
 
     context = "\n\n---\n\n".join(context_parts)
 
-    # Step 3 — build prompt
-    prompt = f"""You are a financial news analyst. Use the context below to answer the question.
-Be concise and factual. Only use information from the provided context.
+    # Step 3 — Fix 4: prompt that permits partial-context reasoning
+    prompt = f"""You are a senior financial news analyst with deep knowledge of Indian and global markets.
 
-Context:
+You have been provided with excerpts from recent news articles as context. Your task is to answer the user's question as accurately and helpfully as possible.
+
+Guidelines:
+- Use the provided context as your primary source of information.
+- If the context directly answers the question, base your answer on it and cite the relevant details.
+- If the context is only partially relevant or covers a related but not identical topic, use it as supporting evidence and clearly supplement with your general financial and economic knowledge to give a complete answer.
+- If the context contains no information related to the question at all, answer using your general knowledge of financial markets and economics, and explicitly state that your answer is based on general knowledge rather than today's fetched articles.
+- Always be clear when switching between context-based information and general knowledge. For example: "Based on the fetched articles, ..." or "Based on general market knowledge, ..."
+- Be concise, factual, and avoid speculation beyond reasonable financial analysis.
+
+Context from fetched articles:
 {context}
 
 Question: {question}
 
 Answer:"""
 
-    # Step 4 — call provider LLM (one line changed from original)
+    # Step 4 — call provider LLM (unchanged from original)
     llm = llm_provider.get_llm()
     answer = llm.invoke(prompt)
 
@@ -411,7 +493,7 @@ Answer:"""
 def ingest(urls: list[str], store_path: str = FAISS_STORE_PATH) -> object:
     """
     Run the full ingestion pipeline:
-      load → split → filter (Layer 1) → embed → store
+      load -> split -> filter (Layer 1) -> embed -> store
 
     Args:
         urls:       Article URLs from feed_fetcher
@@ -441,7 +523,7 @@ if __name__ == "__main__":
 
     print("\n=== Query ===")
     retriever = get_retriever(vs)
-    q = "What is happening with Sensex today?"
+    q = "What is the effect of Bengal election on Indian stock market?"
     result = query(q, retriever)
     print(f"\nQ: {q}")
     print(f"A: {result['answer']}")
