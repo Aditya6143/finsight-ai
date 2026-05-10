@@ -59,15 +59,15 @@ st.sidebar.markdown(
     "FinSight AI automatically pulls from **Reuters, Economic Times, "
     "Moneycontrol, Yahoo Finance, Bloomberg, and Mint**.\n\n"
     "Optionally add a keyword to also fetch matching Google News articles.\n\n"
-    "**Tip:** If your question is about a specific event (e.g. Bengal elections, "
-    "RBI policy), entering it as a keyword before fetching gives the most relevant "
+    "**Tip:** If your question is about a specific event (e.g. Nifty 50, "
+    "RBI policy, Sensex), entering it as a keyword before fetching gives the most relevant "
     "results. Even without a keyword, FinSight AI will auto-fetch topic articles "
     "when you ask a question."
 )
 
 keyword = st.sidebar.text_input(
     "Keyword (optional)",
-    placeholder="e.g. Bengal election, RBI policy, Nifty 50",
+    placeholder="e.g. Sensex, RBI policy, Nifty 50, Election",
 )
 
 fetch_clicked = st.sidebar.button("Fetch & Process News", use_container_width=True)
@@ -278,7 +278,7 @@ if not st.session_state.ingestion_done:
 else:
     question = st.text_input(
         "Ask a question about today's finance news:",
-        placeholder="e.g. What is the effect of Bengal election on the stock market?",
+        placeholder="e.g. What is happening with Sensex today?",
     )
 
     send_clicked = st.button("Send", type="primary")
